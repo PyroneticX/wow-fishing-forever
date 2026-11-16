@@ -498,7 +498,10 @@ class Presenter:
 
     def record_and_verify(self, seconds: float = 60.0, selector: str | None = None) -> None:
         threading.Thread(
-            target=self._verify_worker, args=(seconds, selector), name=_rand_thread_name(), daemon=True
+            target=self._verify_worker,
+            args=(seconds, selector),
+            name=_rand_thread_name(),
+            daemon=True,
         ).start()
 
     def _verify_worker(self, seconds: float, selector: str | None) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
 import random
 import time
@@ -48,6 +49,55 @@ QUIT_TRIES = 3  # quit key presses before giving up on closing the game
 BUSY = (State.CASTING, State.WAIT_BITE, State.INTERACT)  # a cast in hand
 
 
+class _HumanDynamics:
+    """Ex-Gaussian reaction distribution, AR(1) attention wave, motor coupling, and fatigue."""
+
+    def __init__(self, rng: random.Random, session_s: float) -> None:
+        self._rng = rng
+        self._session_s = max(1800.0, session_s) if session_s > 0 else 2250.0
+        self._drift = 0.0
+        self.last_rt_ratio = 1.0
+
+    def _step_wave(self, elapsed_s: float) -> tuple[float, float]:
+        # Ornstein-Uhlenbeck / AR(1) attention wave (alpha = 0.72) + non-linear fatigue
+        self._drift = 0.72 * self._drift + math.sqrt(1.0 - 0.72**2) * self._rng.gauss(0.0, 1.0)
+        progress = min(1.25, max(0.0, elapsed_s / self._session_s))
+        fatigue = 1.0 + 0.18 * (progress**2)
+        return self._drift, fatigue
+
+    def reaction_s(self, base_s: float, elapsed_s: float) -> float:
+        if base_s <= 0.0:
+            self.last_rt_ratio = 1.0
+            return 0.0
+        drift, fatigue = self._step_wave(elapsed_s)
+        # Fast gamer profile anchored on base_s: Ex-Gaussian = Normal(mu, sigma) + Exp(tau)
+        mu = max(0.145, base_s * 0.78 * fatigue + drift * 0.018)
+        sigma = max(0.012, base_s * 0.09)
+        tau = max(0.022, base_s * 0.24 * fatigue * (1.0 + max(0.0, drift) * 0.28))
+        rt = self._rng.gauss(mu, sigma) + self._rng.expovariate(1.0 / tau)
+        clamped = min(0.880, max(0.142, rt))
+        self.last_rt_ratio = min(1.38, max(0.80, clamped / max(0.150, base_s)))
+        return clamped
+
+    def hold_s(self, base_hold_s: float) -> float:
+        if base_hold_s <= 0.0:
+            return 0.0
+        # Couple key-down duration to current reaction speed with log-normal right skew
+        target = max(0.028, base_hold_s * self.last_rt_ratio)
+        hold = self._rng.lognormvariate(math.log(target), 0.14)
+        return min(0.240, max(0.026, hold))
+
+    def pause_s(self, min_s: float, max_s: float, elapsed_s: float) -> float:
+        if max_s <= 0.0:
+            return 0.0
+        _, fatigue = self._step_wave(elapsed_s)
+        span = max(0.05, max_s - min_s)
+        mu = (min_s + span * 0.35) * fatigue
+        tau = max(0.08, span * 0.45 * fatigue)
+        val = self._rng.gauss(mu, span * 0.12) + self._rng.expovariate(1.0 / tau)
+        return min(max_s * 2.1, max(min_s * 0.85, val))
+
+
 class FishingEngine:
     def __init__(
         self,
@@ -91,9 +141,11 @@ class FishingEngine:
         self._icon_timeouts = 0
         self._clock = clock
         self._sleep = sleep
-        self._rng = rng or random.Random()
+        self._rng = rng or random.Random(int.from_bytes(os.urandom(16), "big"))
         self.behavior = Behavior(cfg.behavior, cfg.run.key_hold_ms, self._rng)
         self.session_s = cfg.game.session_minutes * 60.0 if session_s is None else session_s
+        self._live_human = clock is time.monotonic and rng is None
+        self._human = _HumanDynamics(self._rng, self.session_s)
         self.box_interval_s = box_interval_s
         self.lost_after = lost_after
 
@@ -287,7 +339,9 @@ class FishingEngine:
             if self.behavior.skip_bite():
                 self._miss("Let this bite go on purpose")
                 return
-            self._wait(self.behavior.reaction_s())
+            base_rt = self.behavior.reaction_s()
+            rt_s = self._human.reaction_s(base_rt, self._elapsed()) if self._live_human else base_rt
+            self._wait(rt_s)
             if self._stop:
                 return
             if self.input.is_game_focused(self.window) is False:
@@ -427,7 +481,9 @@ class FishingEngine:
         return False
 
     def _press(self, key: str, why: str) -> None:
-        self.input.press_key(key, self.behavior.hold_s())
+        base_hold = self.behavior.hold_s()
+        hold = self._human.hold_s(base_hold) if self._live_human else base_hold
+        self.input.press_key(key, hold)
         self._emit(ev.KeyPressed(self._t(), key, why))
 
     def _miss(self, did: str) -> None:
@@ -438,7 +494,12 @@ class FishingEngine:
         self._pause_then_idle(did)
 
     def _pause_then_idle(self, did: str) -> None:
-        pause = self._rng.uniform(self.cfg.run.pause_min_s, self.cfg.run.pause_max_s)
+        if self._live_human:
+            pause = self._human.pause_s(
+                self.cfg.run.pause_min_s, self.cfg.run.pause_max_s, self._elapsed()
+            )
+        else:
+            pause = self._rng.uniform(self.cfg.run.pause_min_s, self.cfg.run.pause_max_s)
         rest = self.behavior.break_s(self._clock())
         if rest > 0 and self.session_s != 0:  # a break never outlasts the session
             rest = min(rest, max(0.0, self.session_s - self._elapsed()))
@@ -543,7 +604,6 @@ def _thumbnail(frame: np.ndarray, x: int, y: int, size: int) -> tuple[np.ndarray
 def unsupported_platform() -> str:
     """Why the bot cannot run here, or "" when it can (Linux X11/Xwayland/Hyprland, Windows,
     macOS)."""
-    import os
     import sys
 
     if sys.platform == "win32" or macos() or linux_x11() or linux_hyprland():
@@ -632,6 +692,14 @@ def build_engine(
         )
         save_config(replace(current, vision=vision))
 
+    # Enforce randomized 30-45 min auto-stop ceiling per manual activation
+    seed_rng = random.Random(int.from_bytes(os.urandom(16), "big"))
+    auto_stop_s = min(45.0, max(30.0, seed_rng.gauss(37.5, 3.8))) * 60.0
+    cfg_limit_s = cfg.game.session_minutes * 60.0 if session_s is None else session_s
+    effective_session_s = (
+        min(cfg_limit_s, auto_stop_s) if cfg_limit_s and cfg_limit_s > 0 else auto_stop_s
+    )
+
     detector = detector_for(cfg.audio)
     audio: Any = ThreadedSource(open_capture(cfg.audio.selector, pid=window.pid, title=title))
     if record_audio is not None:
@@ -646,7 +714,7 @@ def build_engine(
         matcher_factory=matcher_factory,
         on_calibrated=on_calibrated,
         find_window=lambda t=title: find_window(t),
-        session_s=session_s,
+        session_s=effective_session_s,
     )
 
 
